@@ -1,55 +1,60 @@
-# 会话额度监控插件（Quota Meter · 静态版）
+# 会话额度监控插件（Quota Meter · 官方 bundle 版）
 
 给 DSH 的**每个会话窗口**设置金额额度：按 DeepSeek 官方 API 价格用真实 token 用量记账，
 在输入框上方显示消耗进度条，额度耗尽时拦截新的模型调用并弹出提示。
 
-## 从仓库安装（任何机器，一键）
+## 形态
 
-本仓库即插件的**唯一来源**。在任意装有 dsh 的机器上：
+本插件是 **官方 dsh 组合包（bundle）**：一个 npm 包，manifest 声明
+`"dsh": { "bundle": { "patch": "./cordis.patch.yml" } }`，用 `dsh plugin` 安装进 profile，
+由 dsh 的插件生命周期统一管理（依赖、组合层、卸载）。
+
+- **Host 半部**（记账 + 拦截 + HTTP 接口）→ 包 `quota-meter`（本仓库根，`index.js`）
+- **Client 半部**（进度条 UI，`dsh.client` bundle）→ 子包 `quota-meter-client`（`client/`），
+  作为 host 包的 `file:./client` 依赖随 bundle 一起安装
+- **组合层** → 本仓库 `cordis.patch.yml`（两条 insert 行），由 profile 的
+  `dsh.profile.bundles` 层列表激活
+- **数据通道**：Host 通过 `webServer` 注册 `/quota` HTTP 路由；Client 用 `fetch` 调用
+
+## 安装
+
+任意装有 dsh 的机器，一键：
 
 ```bash
-git clone https://github.com/uncleshushushu-prog/dsh-quota-meter.git
-cd dsh-quota-meter
-bash install.sh        # 可选环境变量：PROFILE=web（默认）、DSH_HOME=~/.dsh
+# 方式一：本地 checkout（开发模式，pnpm 以链接安装，改动即时可见）
+dsh plugin --profile web add /path/to/quota-meter-plugin
+
+# 方式二：git 仓库（纯 JS、无构建步骤，源码即产物）
+dsh plugin --profile web add github:uncleshushushu-prog/dsh-quota-meter
+
+# 方式三：仓库内的一键脚本（等价于方式一）
+bash install.sh        # PROFILE=web 默认；DSH_CMD 可覆盖 dsh 命令
 ```
 
-脚本做三件事：把 host 半部装为 `quota-meter` 包、client 半部装为 `quota-meter-client`
-包（都在 `<dsh-home>/profiles/node_modules/` 下）、向 `<profile>/cordis.patch.yml`
-幂等追加组合行。之后：
+生效方式：
 
 - **Client 改动**（进度条 UI）→ 刷新浏览器页面即生效；
 - **Host 改动**（记账/拦截）→ 重启 dsh web 进程生效。
 
-升级：`git pull` 后再跑一次 `bash install.sh`（覆盖文件 + 组合行幂等）。
-卸载：`bash uninstall.sh`。
+卸载：`dsh plugin --profile web remove quota-meter`（同时移除依赖与组合层），或 `bash uninstall.sh`。
 
-> 注意：本插件以**静态 cordis 形式**安装（文件拷贝 + 手写组合行），不是官方
-> `dsh plugin add` 的 bundle 形式。当前 dsh web 进程正运行这套静态版，请勿在
-> 运行中机器上改动安装布局，避免重启后插件丢失。
-
-## 形态与安装
-
-本插件以**静态 Cordis 插件**形式永久安装（官方 cordis 组合机制），重启 dsh 自动加载：
-
-- **Host 半部**（记账+拦截+HTTP 接口）→ 包 `quota-meter`，装在 `~/.dsh/profiles/node_modules/quota-meter/`
-- **Client 半部**（进度条 UI，`dsh.client` bundle）→ 包 `quota-meter-client`，装在 `~/.dsh/profiles/node_modules/quota-meter-client/`
-- **组合行** → `~/.dsh/profiles/web/cordis.patch.yml`（`- insert:` 两行）
-- **数据通道**：静态 Host 通过 `webServer` 注册 `/quota` HTTP 路由；静态 Client 用 `fetch` 调用
+> 源码模式运行 dsh 时（deepseek-harness checkout），把 `dsh` 换成 `pnpm dsh` 并在仓库根执行。
 
 ## 文件结构
 
 ```
-quota-meter-plugin/
-├── install.sh              一键安装脚本（任意机器）
-├── uninstall.sh            一键卸载脚本
-├── README.md               本说明
-└── static/                 静态版完整快照（源码 + package.json + cordis.patch.yml）
-    ├── host.js                Host 半部：记账 / 计费 / 拦截 / HTTP 接口
-    ├── client.js              Client 半部：进度条 UI（conversation.input.dock）+ 耗尽弹窗（shell.overlay）
-    ├── host.package.json      Host 包清单（安装为 quota-meter）
-    ├── client.package.json    Client 包清单（安装为 quota-meter-client）
-    ├── client-node-stub.js    Client 包的 Node 侧占位（能力在浏览器端）
-    └── cordis.patch.yml       组合行（- insert: quota-meter / quota-meter-client）
+quota-meter-plugin/         # bundle 包根（npm 包 quota-meter）
+├── package.json            # dsh.bundle.patch 声明 + file:./client 依赖
+├── cordis.patch.yml        # 组合层：host 行 + client 行
+├── index.js                # Host 半部：记账 / 计费 / 拦截 / HTTP 接口（零依赖 ESM）
+├── client/                 # Client 子包（npm 包 quota-meter-client）
+│   ├── package.json        # dsh.client.platform: web + exports["./client"]
+│   └── lib/
+│       ├── client.js       # 浏览器 bundle（ModuleLoader 格式）
+│       └── index.js        # Node 侧占位（能力在浏览器端）
+├── install.sh              # 一键安装（封装 dsh plugin add .）
+├── uninstall.sh            # 一键卸载（封装 dsh plugin remove）
+└── README.md
 ```
 
 ## 工作原理
@@ -64,7 +69,7 @@ quota-meter-plugin/
 ```
 
 - 计价模型：`计费输入 = inputTokens + cacheReadTokens + cacheWriteTokens`（官方价目分开计），`输出`单独计价；
-- 默认价目表（人民币，每 1M tokens，2025 官方价，改 `static/host.js` 顶部 `PRICES` 即可）：
+- 默认价目表（人民币，每 1M tokens，2025 官方价，改 `index.js` 顶部 `PRICES` 即可）：
 
 | 模型 | 输入（缓存未命中） | 输入（缓存命中） | 输出 |
 |---|---|---|---|
@@ -84,24 +89,24 @@ quota-meter-plugin/
 
 ## 如何修改 / 重新部署
 
-1. 改 `static/host.js` / `static/client.js`；
-2. 覆盖安装到已装位置：
-
-   ```bash
-   cp static/host.js   ~/.dsh/profiles/node_modules/quota-meter/index.js
-   cp static/client.js ~/.dsh/profiles/node_modules/quota-meter-client/lib/client.js
-   ```
-
-3. **Client 改动**：刷新浏览器页面即生效（bundle 按请求从磁盘读取）；**Host 改动**：需重启 dsh web 进程才生效（已注册的路由不会热更新）。
+1. 改 `index.js`（host）/ `client/lib/client.js`（client）；
+2. 安装方式是 `file:` 链接，**改动直接反映到运行位置，无需拷贝**；
+3. **Client 改动**：刷新浏览器页面即生效（bundle 按请求从磁盘读取）；
+   **Host 改动**：重启 dsh web 进程才生效（已注册的路由不会热更新）。
 
 ## UI 落位
 
 - `conversation.input.dock`（id: `quota-meter`, order: 30）— 输入框正上方一整行（与官方待办条/目标条并列，居中限宽 `max-width:min(560px,100%)`，不会横向撑开）；
 - `shell.overlay`（id: `quota-exhausted-toast`, order: 90）— 耗尽时的全屏弹窗。
 
+## 迁移记录
+
+- **v0.2.0**：静态 cordis 版 → 官方 bundle 版（`dsh plugin` 管理生命周期，`file:` 链接安装）。
+- **v0.1.0**：静态版（install.sh 手工拷贝 + 手写组合行），已归档于 git 历史（commit `cb77c29`）。
+
 ## 待办 / 可扩展
 
 - [ ] 子代理消耗并入父会话额度（需要代理树映射）
-- [ ] 价目表做成 UI 可编辑（当前改 `static/host.js` 常量）
+- [ ] 价目表做成 UI 可编辑（当前改 `index.js` 常量）
 - [ ] 额度持久化（如写入 settings / 会话日志，需新机制）
 - [ ] `/quota` HTTP 接口加鉴权（当前仅限本机访问，若暴露到局域网需加 token）
