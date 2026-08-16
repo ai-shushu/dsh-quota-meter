@@ -299,7 +299,10 @@ export function apply(ctx) {
     const target = rootSessionId(options.sessionId)
     const ledger = ledgerOf(target)
     const model = String(options.model || '')
-    inflightCount += 1
+    // 只有主对话调用点亮"请求中"动效；compaction/session-title 等辅助调用
+    // 不参与 inflight 计数，否则后台摘要会让光带在主对话结束后仍继续扫
+    const isPrimary = options.purpose === undefined
+    if (isPrimary) inflightCount += 1
     return (async function* () {
       try {
         const inner = next()
@@ -322,7 +325,7 @@ export function apply(ctx) {
           yield chunk
         }
       } finally {
-        inflightCount -= 1
+        if (isPrimary) inflightCount -= 1
       }
     })()
   })
