@@ -17,6 +17,7 @@
 - **Budget blocking** — 额度耗尽自动拦截新的模型调用（`agent/pre-step`），并弹出提示
 - **Configurable pricing** — 价目表 UI 可编辑、按模型持久化；支持峰谷（time-of-day）定价，每个模型可自定义时区与高峰时段
 - **Per-session scope** — 记账按会话独立，子代理独立记账，辅助调用（标题生成/上下文压缩）同样计费
+- **Persistent ledger** — 额度与已花金额跟随会话持久化（`~/.dsh/storages/quota-meter/sessions/`），重启 dsh 不丢；会话关闭时自动清理，与对话记录生命周期一致
 
 ## 📦 Install / 安装
 

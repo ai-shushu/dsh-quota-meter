@@ -7,7 +7,7 @@
 // 持久化：~/.dsh/storages/quota-meter/prices.json
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
 
 const UNIT = '¥'
 
@@ -161,10 +161,29 @@ function entryPrices(entry) {
 }
 
 export function apply(ctx) {
-  // 每会话记账本：{ quota, spent, calls, exhausted }，进程内临时，会话关闭即清理
+  // 每会话记账本：{ quota, spent, calls, exhausted }——跟随会话持久化：
+  // 惰性从磁盘恢复（~/.dsh/storages/quota-meter/sessions/<id>.json），
+  // 变更即写，会话销毁时删除（与对话记录生命周期一致）
   const ledgers = new Map()
   // 进行中的模型调用数（llm/stream 开始 +1 / 结束 -1），供客户端显示"请求中"动效
   let inflightCount = 0
+
+  const sessionsDir = ctx.dshHomePath('storages', 'quota-meter', 'sessions')
+  const safeId = (id) => String(id).replace(/[^a-zA-Z0-9._-]/g, '_')
+  const sessionPath = (id) => join(sessionsDir, safeId(id) + '.json')
+
+  function persistLedger(sessionId, ledger) {
+    try {
+      mkdirSync(sessionsDir, { recursive: true })
+      writeFileSync(sessionPath(sessionId), JSON.stringify({ quota: ledger.quota, spent: ledger.spent, calls: ledger.calls }))
+    } catch (err) {
+      console.warn('[quota] persist ledger failed: ' + err.message)
+    }
+  }
+
+  function deleteLedgerFile(sessionId) {
+    try { if (existsSync(sessionPath(sessionId))) unlinkSync(sessionPath(sessionId)) } catch { /* 忽略 */ }
+  }
 
   // 价目表：内置默认 + 用户文件覆盖
   const pricesPath = ctx.dshHomePath('storages', 'quota-meter', 'prices.json')
@@ -183,6 +202,20 @@ export function apply(ctx) {
     let entry = ledgers.get(sessionId)
     if (entry === undefined) {
       entry = { quota: null, spent: 0, calls: 0, exhausted: false }
+      // 惰性恢复：会话重启后额度/已花从磁盘取回（若有）
+      try {
+        if (existsSync(sessionPath(sessionId))) {
+          const saved = JSON.parse(readFileSync(sessionPath(sessionId), 'utf8'))
+          if (saved && typeof saved === 'object') {
+            entry.quota = saved.quota === null || saved.quota === undefined ? null : Number(saved.quota) || 0
+            entry.spent = Number(saved.spent) || 0
+            entry.calls = Number(saved.calls) || 0
+            entry.exhausted = entry.quota !== null && entry.spent >= entry.quota
+          }
+        }
+      } catch (err) {
+        console.warn('[quota] failed to restore ledger: ' + err.message)
+      }
       ledgers.set(sessionId, entry)
     }
     return entry
@@ -217,6 +250,7 @@ export function apply(ctx) {
               ledger.spent += cost
               ledger.calls += 1
               if (ledger.quota !== null && ledger.spent >= ledger.quota) ledger.exhausted = true
+              persistLedger(options.sessionId, ledger)
               console.log('[quota] session=' + options.sessionId + ' model=' + model + ' +' + cost.toFixed(6) + ' spent=' + ledger.spent.toFixed(6) + ' calls=' + ledger.calls + ' exhausted=' + ledger.exhausted)
             }
           }
@@ -240,9 +274,10 @@ export function apply(ctx) {
     return next()
   })
 
-  // 会话关闭：清理记账本
+  // 会话关闭：清理记账本（内存 + 磁盘文件，与对话记录生命周期一致）
   ctx.on('session/disposed', (session) => {
     if (session && ledgers.delete(session.id)) {
+      deleteLedgerFile(session.id)
       console.log('[quota] session=' + session.id + ' disposed, ledger cleared')
     }
   })
@@ -312,6 +347,7 @@ export function apply(ctx) {
             const ledger = ledgerOf(sid)
             ledger.quota = amount
             ledger.exhausted = ledger.spent >= amount
+            persistLedger(sid, ledger)
             console.log('[quota] session=' + sid + ' quota set to ' + amount)
             sendJson(res, 200, { ok: true, quota: amount, spent: round4(ledger.spent), calls: ledger.calls, exhausted: ledger.exhausted, unit: UNIT })
             return
@@ -321,6 +357,7 @@ export function apply(ctx) {
             if (ledger !== undefined) {
               ledger.quota = null
               ledger.exhausted = false
+              persistLedger(sid, ledger)
             }
             sendJson(res, 200, { ok: true })
             return
