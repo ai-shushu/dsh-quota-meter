@@ -24,7 +24,7 @@
 dsh plugin --profile web add /path/to/quota-meter-plugin
 
 # 方式二：git 仓库（纯 JS、无构建步骤，源码即产物）
-dsh plugin --profile web add github:uncleshushushu-prog/dsh-quota-meter
+dsh plugin --profile web add github:ai-shushu/dsh-quota-meter
 
 # 方式三：仓库内的一键脚本（等价于方式一）
 bash install.sh        # PROFILE=web 默认；DSH_CMD 可覆盖 dsh 命令
