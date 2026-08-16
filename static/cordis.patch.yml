@@ -1,0 +1,14 @@
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+
+# ── 用户插件：会话额度监控（quota-meter，静态永久版）────────────────────────
+# Host 半部：按 DeepSeek 官方价格记账（llm/stream）+ 额度耗尽拦截（agent/pre-step）
+#            + HTTP 状态接口（/quota 前缀路由）
+# Client 半部：浏览器 bundle（dsh.client），输入框上方进度条 + 耗尽弹窗
+- insert:
+    - id: quota-meter
+      name: 'quota-meter'
+
+    - id: quota-meter-client
+      name: 'quota-meter-client'
