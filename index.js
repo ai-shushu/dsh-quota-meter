@@ -165,6 +165,9 @@ export function apply(ctx) {
   // 惰性从磁盘恢复（~/.dsh/storages/quota-meter/sessions/<id>.json），
   // 变更即写，会话销毁时删除（与对话记录生命周期一致）
   const ledgers = new Map()
+  // 子代理会话 → 根父会话 映射：subagent/start 建立，持久化到子会话文件；
+  // 子代理的消耗并入父会话额度（沿链上溯到根父）
+  const parentMap = new Map()
   // 进行中的模型调用数（llm/stream 开始 +1 / 结束 -1），供客户端显示"请求中"动效
   let inflightCount = 0
 
@@ -175,7 +178,9 @@ export function apply(ctx) {
   function persistLedger(sessionId, ledger) {
     try {
       mkdirSync(sessionsDir, { recursive: true })
-      writeFileSync(sessionPath(sessionId), JSON.stringify({ quota: ledger.quota, spent: ledger.spent, calls: ledger.calls }))
+      const data = { quota: ledger.quota, spent: ledger.spent, calls: ledger.calls, unpricedModels: ledger.unpricedModels || [] }
+      if (parentMap.has(sessionId)) data.parentId = parentMap.get(sessionId)
+      writeFileSync(sessionPath(sessionId), JSON.stringify(data))
     } catch (err) {
       console.warn('[quota] persist ledger failed: ' + err.message)
     }
@@ -184,6 +189,56 @@ export function apply(ctx) {
   function deleteLedgerFile(sessionId) {
     try { if (existsSync(sessionPath(sessionId))) unlinkSync(sessionPath(sessionId)) } catch { /* 忽略 */ }
   }
+
+  // 沿父子链上溯到根父会话（子代理还能派子代理，最多 32 层防环）
+  function rootSessionId(sessionId) {
+    let cur = sessionId
+    let hops = 0
+    while (parentMap.has(cur) && hops < 32) {
+      cur = parentMap.get(cur)
+      hops += 1
+    }
+    return cur
+  }
+
+  // 子代理归并：subagent/start（global 监听，拿 runId + 子会话 id）记录
+  // 子代理归并：subagent/start（global 监听）记录子会话 id；tools/result
+  // （父会话作用域，exec.agent=父）取最早未归并的子会话，建立 child->parent
+  // 映射并把子会话运行中已记的消耗合并进父（事后补归 + 后续实时归并）
+  const pendingChildren = [] // FIFO：subagent/start 记录的子会话 id（按创建顺序）
+  ctx.on('subagent/start', (info) => {
+    if (info && info.id) pendingChildren.push(String(info.id))
+  }, { global: true })
+
+  // global: true —— tools/result 是作用域事件（carrier=执行工具的会话），
+  // 不带 global 的全局监听会被 context filter 过滤掉，收不到
+  ctx.on('tools/result', async (exec) => {
+    if (!exec || !exec.agent || !exec.agent.session) return
+    if (!/^subagent/.test(String(exec.name || ''))) return
+    const parentId = String(exec.agent.session.id)
+    // 匹配最早一个尚未归并的子代理（subagent/start 先于 tools/result 触发）
+    const childId = pendingChildren.length > 0 ? pendingChildren.shift() : ''
+    if (!childId) return
+    try {
+      if (parentMap.has(childId)) return
+      parentMap.set(childId, parentId)
+      // 合并子会话运行中已独立记的消耗到父
+      const childLedger = ledgers.get(childId)
+      if (childLedger && childLedger.spent > 0) {
+        const parentLedger = ledgerOf(parentId)
+        parentLedger.spent += childLedger.spent
+        parentLedger.calls += childLedger.calls
+        if (parentLedger.quota !== null && parentLedger.spent >= parentLedger.quota) parentLedger.exhausted = true
+        childLedger.spent = 0
+        childLedger.calls = 0
+        persistLedger(parentId, parentLedger)
+      }
+      persistLedger(childId, { quota: null, spent: 0, calls: 0 })
+      console.log('[quota] subagent merged child=' + childId + ' -> parent=' + parentId)
+    } catch (err) {
+      console.warn('[quota] subagent merge failed: ' + err.message)
+    }
+  })
 
   // 价目表：内置默认 + 用户文件覆盖
   const pricesPath = ctx.dshHomePath('storages', 'quota-meter', 'prices.json')
@@ -201,7 +256,7 @@ export function apply(ctx) {
   function ledgerOf(sessionId) {
     let entry = ledgers.get(sessionId)
     if (entry === undefined) {
-      entry = { quota: null, spent: 0, calls: 0, exhausted: false }
+      entry = { quota: null, spent: 0, calls: 0, exhausted: false, unpricedModels: [] }
       // 惰性恢复：会话重启后额度/已花从磁盘取回（若有）
       try {
         if (existsSync(sessionPath(sessionId))) {
@@ -211,6 +266,9 @@ export function apply(ctx) {
             entry.spent = Number(saved.spent) || 0
             entry.calls = Number(saved.calls) || 0
             entry.exhausted = entry.quota !== null && entry.spent >= entry.quota
+            entry.unpricedModels = Array.isArray(saved.unpricedModels) ? saved.unpricedModels.map(String) : []
+            // 恢复子代理映射（子会话文件带 parentId）
+            if (saved.parentId) parentMap.set(sessionId, String(saved.parentId))
           }
         }
       } catch (err) {
@@ -234,10 +292,12 @@ export function apply(ctx) {
 
   function round4(v) { return Math.round(v * 10000) / 10000 }
 
-  // 每次模型调用：真实 usage chunk -> 记账；同时维护"请求进行中"计数
+  // 每次模型调用：真实 usage chunk -> 记账（子代理消耗并入根父会话）；
+  // 同时维护"请求进行中"计数 + 记录未配价模型
   ctx.on('llm/stream', (options, next) => {
     if (options.sessionId === undefined) return next()
-    const ledger = ledgerOf(options.sessionId)
+    const target = rootSessionId(options.sessionId)
+    const ledger = ledgerOf(target)
     const model = String(options.model || '')
     inflightCount += 1
     return (async function* () {
@@ -245,13 +305,18 @@ export function apply(ctx) {
         const inner = next()
         for await (const chunk of inner) {
           if (chunk && chunk.type === 'usage' && chunk.usage) {
+            // 模型不在价目表 → 记入未配价集合（走 fallback 计价），供客户端提示
+            if (model && !prices.models[model] && ledger.unpricedModels.indexOf(model) < 0) {
+              ledger.unpricedModels.push(model)
+              persistLedger(target, ledger)
+            }
             const cost = costOf(model, chunk.usage)
             if (cost > 0) {
               ledger.spent += cost
               ledger.calls += 1
               if (ledger.quota !== null && ledger.spent >= ledger.quota) ledger.exhausted = true
-              persistLedger(options.sessionId, ledger)
-              console.log('[quota] session=' + options.sessionId + ' model=' + model + ' +' + cost.toFixed(6) + ' spent=' + ledger.spent.toFixed(6) + ' calls=' + ledger.calls + ' exhausted=' + ledger.exhausted)
+              persistLedger(target, ledger)
+              console.log('[quota] session=' + target + ' (child ' + options.sessionId + (target === options.sessionId ? '' : ' -> merged') + ') model=' + model + ' +' + cost.toFixed(6) + ' spent=' + ledger.spent.toFixed(6) + ' calls=' + ledger.calls + ' exhausted=' + ledger.exhausted)
             }
           }
           yield chunk
@@ -274,9 +339,11 @@ export function apply(ctx) {
     return next()
   })
 
-  // 会话关闭：清理记账本（内存 + 磁盘文件，与对话记录生命周期一致）
+  // 会话关闭：清理记账本（内存 + 磁盘文件 + 子代理映射，与对话记录生命周期一致）
   ctx.on('session/disposed', (session) => {
-    if (session && ledgers.delete(session.id)) {
+    if (session) {
+      ledgers.delete(session.id)
+      parentMap.delete(session.id)
       deleteLedgerFile(session.id)
       console.log('[quota] session=' + session.id + ' disposed, ledger cleared')
     }
@@ -329,9 +396,10 @@ export function apply(ctx) {
           // ledgerOf：重启后惰性从磁盘恢复额度/已花（而非只看内存）
           const ledger = ledgerOf(sessionId)
           const inflight = inflightCount > 0
+          const unpricedModels = (ledger && ledger.unpricedModels) || []
           const out = ledger === undefined
-            ? { quota: null, spent: 0, calls: 0, exhausted: false, unit: UNIT, inflight }
-            : { quota: ledger.quota, spent: round4(ledger.spent), calls: ledger.calls, exhausted: ledger.exhausted, unit: UNIT, inflight }
+            ? { quota: null, spent: 0, calls: 0, exhausted: false, unit: UNIT, inflight, unpricedModels }
+            : { quota: ledger.quota, spent: round4(ledger.spent), calls: ledger.calls, exhausted: ledger.exhausted, unit: UNIT, inflight, unpricedModels }
           sendJson(res, 200, out)
           return
         }
