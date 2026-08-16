@@ -22,6 +22,7 @@ const DEFAULT_PRICES = {
     'deepseek-v4-flash': {
       provider: 'deepseek',
       pricing: 'per-token-tod',
+      tod: { tz: 'Asia/Shanghai', peak: [[9, 12], [14, 18]] },
       prices: {
         default: { inputMiss: 1.5, inputHit: 0.05, output: 4.5 },
         peak: { inputMiss: 3.0, inputHit: 0.10, output: 9.0 },
@@ -30,6 +31,7 @@ const DEFAULT_PRICES = {
     'deepseek-v4-pro': {
       provider: 'deepseek',
       pricing: 'per-token-tod',
+      tod: { tz: 'Asia/Shanghai', peak: [[9, 12], [14, 18]] },
       prices: {
         default: { inputMiss: 4.5, inputHit: 0.15, output: 13.5 },
         peak: { inputMiss: 9.0, inputHit: 0.30, output: 27.0 },
@@ -60,11 +62,25 @@ function readJsonBody(req) {
   })
 }
 
-// DeepSeek 高峰时段为北京时间 9:00-12:00、14:00-18:00（含起点、不含终点）
-function isPeakTime(date) {
-  const d = new Date((date || new Date()).getTime() + 8 * 3600 * 1000) // 转 UTC+8
-  const h = d.getUTCHours()
-  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
+// DeepSeek 高峰时段为北京时间 9:00-12:00、14:00-18:00（含起点、不含终点）。
+// 峰谷规则是【模型属性】：每个 per-token-tod 模型通过 entry.tod 声明自己的
+// 时区与高峰区间（{ tz, peak: [[start,end], ...] }），缺省用 DeepSeek 默认。
+function hourInTz(tz, date) {
+  try {
+    const s = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", hour12: false }).format(date || new Date())
+    return Number(s) % 24
+  } catch {
+    const d = new Date((date || new Date()).getTime() + 8 * 3600 * 1000) // 回退 UTC+8
+    return d.getUTCHours()
+  }
+}
+
+function isPeakTime(tz, peakWindows, date) {
+  const h = hourInTz(tz || "Asia/Shanghai", date)
+  for (const w of peakWindows || []) {
+    if (h >= w[0] && h < w[1]) return true
+  }
+  return false
 }
 
 // 校验一组三档价格
@@ -98,7 +114,29 @@ function normalizePrices(input) {
         if (!pk.ok) return { ok: false, reason: 'model "' + model + '": peak ' + pk.reason }
         peak = pk.value
       }
-      models[model] = { provider, pricing, prices: { default: def.value, ...(peak ? { peak } : {}) } }
+      // 峰谷时段（模型属性）：{ tz, peak: [[s,e],...] }，缺省 DeepSeek 默认
+      let tod = { tz: 'Asia/Shanghai', peak: [[9, 12], [14, 18]] }
+      if (p.tod !== undefined) {
+        if (typeof p.tod !== 'object' || p.tod === null) return { ok: false, reason: 'model "' + model + '": tod must be an object' }
+        const tz = (typeof p.tod.tz === 'string' && p.tod.tz) ? p.tod.tz : 'Asia/Shanghai'
+        let windows = [[9, 12], [14, 18]]
+        if (p.tod.peak !== undefined) {
+          if (!Array.isArray(p.tod.peak) || p.tod.peak.length === 0) return { ok: false, reason: 'model "' + model + '": tod.peak must be a non-empty array' }
+          const parsed = []
+          for (const w of p.tod.peak) {
+            if (!Array.isArray(w) || w.length !== 2) return { ok: false, reason: 'model "' + model + '": tod.peak window must be [start,end]' }
+            const s = Number(w[0])
+            const e = Number(w[1])
+            if (![s, e].every(Number.isFinite) || s < 0 || e > 24 || s >= e) {
+              return { ok: false, reason: 'model "' + model + '": tod.peak window must satisfy 0 <= start < end <= 24' }
+            }
+            parsed.push([s, e])
+          }
+          windows = parsed
+        }
+        tod = { tz, peak: windows }
+      }
+      models[model] = { provider, pricing, tod, prices: { default: def.value, ...(peak ? { peak } : {}) } }
     } else if (pricing === 'per-token') {
       const tri = p.prices ? parseTriple(p.prices) : parseTriple(p) // v2 用 prices，v1 用平铺字段
       if (!tri.ok) return { ok: false, reason: 'model "' + model + '": ' + tri.reason }
@@ -112,10 +150,11 @@ function normalizePrices(input) {
   return { ok: true, prices: { version: 2, unit: UNIT, per: '1M', fallback, models } }
 }
 
-// 按定价模式取当前生效价格组
+// 按定价模式取当前生效价格组（峰谷规则随模型自己的 tod 声明）
 function entryPrices(entry) {
   if (entry.pricing === 'per-token-tod') {
-    const peak = isPeakTime()
+    const tod = entry.tod || { tz: 'Asia/Shanghai', peak: [[9, 12], [14, 18]] }
+    const peak = isPeakTime(tod.tz, tod.peak)
     return peak && entry.prices.peak ? entry.prices.peak : entry.prices.default
   }
   return entry.prices
