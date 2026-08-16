@@ -1,22 +1,40 @@
 // 会话额度监控（Host 半部）— 记账 / 计费 / 拦截 / HTTP 接口
 // 由 cordis.patch.yml 加载；数据通道为 HTTP（/quota 前缀路由）。
-// 价目表：内置默认 + 用户文件（~/.dsh/storages/quota-meter/prices.json）覆盖，
-// 面向多平台多模型：models 以模型名作键，每条带 provider 标注（仅 UI 分组用）。
+// 价目表 v2：定价模式化。每个模型声明 pricing 模式：
+//   - per-token     恒定价（多数厂商）：prices = { inputMiss, inputHit, output }
+//   - per-token-tod 按 token + 分时段（DeepSeek 峰谷）：prices = { default, peak? }
+// 旧 v1 结构（无 pricing）加载时自动归一化为 per-token。
+// 持久化：~/.dsh/storages/quota-meter/prices.json
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
 const UNIT = '¥'
 
-// 默认价目表（人民币，每 1M tokens，2025 官方价；UI 可编辑并持久化）
+// 默认价目表（人民币，每 1M tokens；DeepSeek 2026-08-17 起峰谷定价，
+// default=空闲时段、peak=高峰时段；可随时在 UI 弹层修改并持久化）
 const DEFAULT_PRICES = {
-  version: 1,
+  version: 2,
   unit: UNIT,
   per: '1M',
-  fallback: 'deepseek-chat',
+  fallback: 'deepseek-v4-flash',
   models: {
-    'deepseek-chat': { provider: 'deepseek', inputMiss: 2.0, inputHit: 0.5, output: 8.0 },
-    'deepseek-reasoner': { provider: 'deepseek', inputMiss: 4.0, inputHit: 1.0, output: 16.0 },
+    'deepseek-v4-flash': {
+      provider: 'deepseek',
+      pricing: 'per-token-tod',
+      prices: {
+        default: { inputMiss: 1.5, inputHit: 0.05, output: 4.5 },
+        peak: { inputMiss: 3.0, inputHit: 0.10, output: 9.0 },
+      },
+    },
+    'deepseek-v4-pro': {
+      provider: 'deepseek',
+      pricing: 'per-token-tod',
+      prices: {
+        default: { inputMiss: 4.5, inputHit: 0.15, output: 13.5 },
+        peak: { inputMiss: 9.0, inputHit: 0.30, output: 27.0 },
+      },
+    },
   },
 }
 
@@ -42,7 +60,26 @@ function readJsonBody(req) {
   })
 }
 
-// 校验并规整价目表（宽松输入 → 规范结构）；失败返回 { ok:false, reason }
+// DeepSeek 高峰时段为北京时间 9:00-12:00、14:00-18:00（含起点、不含终点）
+function isPeakTime(date) {
+  const d = new Date((date || new Date()).getTime() + 8 * 3600 * 1000) // 转 UTC+8
+  const h = d.getUTCHours()
+  return (h >= 9 && h < 12) || (h >= 14 && h < 18)
+}
+
+// 校验一组三档价格
+function parseTriple(obj) {
+  if (!obj || typeof obj !== 'object') return { ok: false, reason: 'prices must be an object' }
+  const inputMiss = Number(obj.inputMiss)
+  const inputHit = Number(obj.inputHit)
+  const output = Number(obj.output)
+  if (![inputMiss, inputHit, output].every(Number.isFinite) || inputMiss < 0 || inputHit < 0 || output < 0) {
+    return { ok: false, reason: 'prices must be non-negative numbers' }
+  }
+  return { ok: true, value: { inputMiss, inputHit, output } }
+}
+
+// 校验并规整价目表（支持 v1 旧结构与 v2 模式化结构）；失败返回 { ok:false, reason }
 function normalizePrices(input) {
   if (!input || typeof input !== 'object') return { ok: false, reason: 'prices must be an object' }
   const raw = input.models
@@ -50,22 +87,38 @@ function normalizePrices(input) {
   const models = {}
   for (const [model, p] of Object.entries(raw)) {
     if (!model || typeof p !== 'object' || p === null) return { ok: false, reason: 'bad model entry for "' + model + '"' }
-    const inputMiss = Number(p.inputMiss)
-    const inputHit = Number(p.inputHit)
-    const output = Number(p.output)
-    if (![inputMiss, inputHit, output].every(Number.isFinite) || inputMiss < 0 || inputHit < 0 || output < 0) {
-      return { ok: false, reason: 'model "' + model + '": prices must be non-negative numbers' }
-    }
-    models[model] = {
-      provider: p.provider === undefined ? '' : String(p.provider),
-      inputMiss,
-      inputHit,
-      output,
+    const provider = p.provider === undefined ? '' : String(p.provider)
+    const pricing = p.pricing === undefined ? 'per-token' : String(p.pricing)
+    if (pricing === 'per-token-tod') {
+      const def = parseTriple(p.prices && p.prices.default)
+      if (!def.ok) return { ok: false, reason: 'model "' + model + '": default ' + def.reason }
+      let peak = null
+      if (p.prices && p.prices.peak !== undefined) {
+        const pk = parseTriple(p.prices.peak)
+        if (!pk.ok) return { ok: false, reason: 'model "' + model + '": peak ' + pk.reason }
+        peak = pk.value
+      }
+      models[model] = { provider, pricing, prices: { default: def.value, ...(peak ? { peak } : {}) } }
+    } else if (pricing === 'per-token') {
+      const tri = p.prices ? parseTriple(p.prices) : parseTriple(p) // v2 用 prices，v1 用平铺字段
+      if (!tri.ok) return { ok: false, reason: 'model "' + model + '": ' + tri.reason }
+      models[model] = { provider, pricing, prices: tri.value }
+    } else {
+      return { ok: false, reason: 'model "' + model + '": unknown pricing "' + pricing + '"' }
     }
   }
   if (Object.keys(models).length === 0) return { ok: false, reason: 'at least one model required' }
   const fallback = (typeof input.fallback === 'string' && models[input.fallback]) ? input.fallback : Object.keys(models)[0]
-  return { ok: true, prices: { version: 1, unit: UNIT, per: '1M', fallback, models } }
+  return { ok: true, prices: { version: 2, unit: UNIT, per: '1M', fallback, models } }
+}
+
+// 按定价模式取当前生效价格组
+function entryPrices(entry) {
+  if (entry.pricing === 'per-token-tod') {
+    const peak = isPeakTime()
+    return peak && entry.prices.peak ? entry.prices.peak : entry.prices.default
+  }
+  return entry.prices
 }
 
 export function apply(ctx) {
@@ -94,13 +147,15 @@ export function apply(ctx) {
     return entry
   }
 
-  // TokenUsage 字段互斥：inputTokens=未命中输入；cacheRead+cacheWrite=缓存输入；outputTokens=输出
+  // TokenUsage 字段互斥（dsh 官方语义）：inputTokens=未缓存输入；
+  // cacheRead+cacheWrite=缓存输入；outputTokens=输出
   function costOf(model, usage) {
     const entry = prices.models[model] || prices.models[prices.fallback]
+    const t = entryPrices(entry)
     const miss = usage.inputTokens || 0
     const hit = (usage.cacheReadTokens || 0) + (usage.cacheWriteTokens || 0)
     const out = usage.outputTokens || 0
-    return (miss * entry.inputMiss + hit * entry.inputHit + out * entry.output) / 1000000
+    return (miss * t.inputMiss + hit * t.inputHit + out * t.output) / 1000000
   }
 
   function round4(v) { return Math.round(v * 10000) / 10000 }
