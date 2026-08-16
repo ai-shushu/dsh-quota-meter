@@ -163,6 +163,8 @@ function entryPrices(entry) {
 export function apply(ctx) {
   // 每会话记账本：{ quota, spent, calls, exhausted }，进程内临时，会话关闭即清理
   const ledgers = new Map()
+  // 进行中的模型调用数（llm/stream 开始 +1 / 结束 -1），供客户端显示"请求中"动效
+  let inflightCount = 0
 
   // 价目表：内置默认 + 用户文件覆盖
   const pricesPath = ctx.dshHomePath('storages', 'quota-meter', 'prices.json')
@@ -199,24 +201,29 @@ export function apply(ctx) {
 
   function round4(v) { return Math.round(v * 10000) / 10000 }
 
-  // 每次模型调用：真实 usage chunk -> 记账
+  // 每次模型调用：真实 usage chunk -> 记账；同时维护"请求进行中"计数
   ctx.on('llm/stream', (options, next) => {
     if (options.sessionId === undefined) return next()
     const ledger = ledgerOf(options.sessionId)
     const model = String(options.model || '')
+    inflightCount += 1
     return (async function* () {
-      const inner = next()
-      for await (const chunk of inner) {
-        if (chunk && chunk.type === 'usage' && chunk.usage) {
-          const cost = costOf(model, chunk.usage)
-          if (cost > 0) {
-            ledger.spent += cost
-            ledger.calls += 1
-            if (ledger.quota !== null && ledger.spent >= ledger.quota) ledger.exhausted = true
-            console.log('[quota] session=' + options.sessionId + ' model=' + model + ' +' + cost.toFixed(6) + ' spent=' + ledger.spent.toFixed(6) + ' calls=' + ledger.calls + ' exhausted=' + ledger.exhausted)
+      try {
+        const inner = next()
+        for await (const chunk of inner) {
+          if (chunk && chunk.type === 'usage' && chunk.usage) {
+            const cost = costOf(model, chunk.usage)
+            if (cost > 0) {
+              ledger.spent += cost
+              ledger.calls += 1
+              if (ledger.quota !== null && ledger.spent >= ledger.quota) ledger.exhausted = true
+              console.log('[quota] session=' + options.sessionId + ' model=' + model + ' +' + cost.toFixed(6) + ' spent=' + ledger.spent.toFixed(6) + ' calls=' + ledger.calls + ' exhausted=' + ledger.exhausted)
+            }
           }
+          yield chunk
         }
-        yield chunk
+      } finally {
+        inflightCount -= 1
       }
     })()
   })
@@ -285,9 +292,10 @@ export function apply(ctx) {
 
         if (req.method === 'GET' && url.pathname === '/quota/state') {
           const ledger = ledgers.get(sessionId)
+          const inflight = inflightCount > 0
           const out = ledger === undefined
-            ? { quota: null, spent: 0, calls: 0, exhausted: false, unit: UNIT }
-            : { quota: ledger.quota, spent: round4(ledger.spent), calls: ledger.calls, exhausted: ledger.exhausted, unit: UNIT }
+            ? { quota: null, spent: 0, calls: 0, exhausted: false, unit: UNIT, inflight }
+            : { quota: ledger.quota, spent: round4(ledger.spent), calls: ledger.calls, exhausted: ledger.exhausted, unit: UNIT, inflight }
           sendJson(res, 200, out)
           return
         }
