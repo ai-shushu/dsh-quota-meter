@@ -10,6 +10,10 @@
 |---|---|
 | ![Set quota](./assets/set-quota.png) | ![Billing feedback](./assets/billing-feedback.png) |
 
+| 未配价模型提示 | 限额弹窗 |
+|---|---|
+| ![Unpriced model](./assets/unpriced-model.png) | ![Quota exhausted](./assets/quota-exhausted.png) |
+
 ## ✨ Features / 特性
 
 - **Real-token billing** — 按 dsh `llm/stream` 的真实 usage 记账，缓存命中/未命中/输出分档计费
