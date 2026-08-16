@@ -262,11 +262,11 @@ export function apply(ctx) {
     })()
   })
 
-  // 额度耗尽：拦截新的模型调用
+  // 额度耗尽：拦截新的模型调用（ledgerOf：重启后从磁盘恢复额度状态）
   ctx.on('agent/pre-step', async (payload, next) => {
     const session = payload.agent && payload.agent.session
     if (session === undefined) return next()
-    const ledger = ledgers.get(session.id)
+    const ledger = ledgerOf(session.id)
     if (ledger !== undefined && ledger.quota !== null && ledger.exhausted) {
       console.log('[quota] session=' + session.id + ' step rejected (quota exhausted)')
       return { kind: 'reject' }
@@ -326,7 +326,8 @@ export function apply(ctx) {
         }
 
         if (req.method === 'GET' && url.pathname === '/quota/state') {
-          const ledger = ledgers.get(sessionId)
+          // ledgerOf：重启后惰性从磁盘恢复额度/已花（而非只看内存）
+          const ledger = ledgerOf(sessionId)
           const inflight = inflightCount > 0
           const out = ledger === undefined
             ? { quota: null, spent: 0, calls: 0, exhausted: false, unit: UNIT, inflight }
@@ -353,7 +354,7 @@ export function apply(ctx) {
             return
           }
           if (url.pathname === '/quota/clear') {
-            const ledger = ledgers.get(sid)
+            const ledger = ledgerOf(sid)
             if (ledger !== undefined) {
               ledger.quota = null
               ledger.exhausted = false
