@@ -18,6 +18,7 @@ const DEFAULT_PRICES = {
   unit: UNIT,
   per: '1M',
   fallback: 'deepseek-v4-flash',
+  ignored: [],
   models: {
     'deepseek-v4-flash': {
       provider: 'deepseek',
@@ -147,7 +148,9 @@ function normalizePrices(input) {
   }
   if (Object.keys(models).length === 0) return { ok: false, reason: 'at least one model required' }
   const fallback = (typeof input.fallback === 'string' && models[input.fallback]) ? input.fallback : Object.keys(models)[0]
-  return { ok: true, prices: { version: 2, unit: UNIT, per: '1M', fallback, models } }
+  // 用户主动忽略的未配价模型（不再在 UI 提示），随价目表持久化
+  const ignored = Array.isArray(input.ignored) ? input.ignored.filter((s) => typeof s === 'string') : []
+  return { ok: true, prices: { version: 2, unit: UNIT, per: '1M', fallback, models, ignored } }
 }
 
 // 按定价模式取当前生效价格组（峰谷规则随模型自己的 tod 声明）
@@ -377,6 +380,24 @@ export function apply(ctx) {
             prices = DEFAULT_PRICES
             try { if (existsSync(pricesPath)) unlinkSync(pricesPath) } catch { /* 忽略 */ }
             console.log('[quota] prices reset to default')
+            sendJson(res, 200, { ok: true, prices })
+            return
+          }
+          // 忽略 / 取消忽略某个未配价模型（逐个操作，持久化到价目表）
+          if (body && (body.ignore !== undefined || body.unignore !== undefined)) {
+            const name = String(body.ignore !== undefined ? body.ignore : body.unignore).trim()
+            if (!name) { sendJson(res, 400, { ok: false, reason: 'model name required' }); return }
+            const set = new Set(prices.ignored || [])
+            if (body.ignore !== undefined) set.add(name)
+            else set.delete(name)
+            prices = Object.assign({}, prices, { ignored: [...set] })
+            try {
+              mkdirSync(dirname(pricesPath), { recursive: true })
+              writeFileSync(pricesPath, JSON.stringify(prices, null, 2))
+            } catch (err) {
+              sendJson(res, 500, { ok: false, reason: 'persist failed: ' + err.message })
+              return
+            }
             sendJson(res, 200, { ok: true, prices })
             return
           }
