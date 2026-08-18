@@ -19,6 +19,7 @@ const DEFAULT_PRICES = {
   per: '1M',
   fallback: 'deepseek-v4-flash',
   ignored: [],
+  plans: [],
   models: {
     'deepseek-v4-flash': {
       provider: 'deepseek',
@@ -150,7 +151,9 @@ function normalizePrices(input) {
   const fallback = (typeof input.fallback === 'string' && models[input.fallback]) ? input.fallback : Object.keys(models)[0]
   // 用户主动忽略的未配价模型（不再在 UI 提示），随价目表持久化
   const ignored = Array.isArray(input.ignored) ? input.ignored.filter((s) => typeof s === 'string') : []
-  return { ok: true, prices: { version: 2, unit: UNIT, per: '1M', fallback, models, ignored } }
+  // 套餐模型（无具体费用，调用不计费），随价目表持久化
+  const plans = Array.isArray(input.plans) ? input.plans.filter((s) => typeof s === 'string') : []
+  return { ok: true, prices: { version: 2, unit: UNIT, per: '1M', fallback, models, ignored, plans } }
 }
 
 // 按定价模式取当前生效价格组（峰谷规则随模型自己的 tod 声明）
@@ -175,6 +178,9 @@ export function apply(ctx) {
   let inflightCount = 0
   // 最近一次主调用使用的模型（apiProxy 查询当前会话模型的兜底）
   let lastModel = null
+  // Plan 调用信号：套餐模型调用不计费，客户端显示 "Plan" 徽标代替金额
+  let planTick = 0
+  let lastPlanModel = null
   // 当前会话选中模型查询缓存（按 sessionId + TTL 1.5s，避免 1s 轮询每次都打 RPC）
   const modelQueryCache = { at: 0, sessionId: null, value: null }
 
@@ -194,6 +200,42 @@ export function apply(ctx) {
     modelQueryCache.at = now
     modelQueryCache.value = value
     return value
+  }
+
+  // 模型目录缓存（TTL 60s）：provider 广告的模型列表变化很慢，避免每次打开弹层都重建
+  const catalogCache = { at: 0, groups: null }
+
+  async function modelCatalogGroups(sessionId) {
+    const now = Date.now()
+    if (catalogCache.groups && now - catalogCache.at < 60000) return catalogCache.groups
+    let groups = []
+    try {
+      const r = await ctx.apiProxy.sessions.models({ rpcId: 'quota-catalog-' + now, payload: { sessionId } })
+      const res = r && r.result
+      groups = (res && res.ok && res.value && res.value.groups) || []
+    } catch { groups = [] }
+    catalogCache.groups = groups
+    catalogCache.at = now
+    return groups
+  }
+
+  // 目录中未配价的模型（排除已配价/已忽略/Plan），按 provider 分组
+  async function catalogUnpricedOf(sessionId) {
+    const groups = await modelCatalogGroups(sessionId)
+    const priced = prices.models || {}
+    const ignored = prices.ignored || []
+    const plans = prices.plans || []
+    const out = []
+    for (const g of groups || []) {
+      const items = []
+      for (const m of (g.models || [])) {
+        const id = m && m.id
+        if (!id || priced[id] || ignored.indexOf(id) >= 0 || plans.indexOf(id) >= 0) continue
+        items.push(id)
+      }
+      if (items.length > 0) out.push({ provider: g.id, providerName: g.name || g.id, models: items })
+    }
+    return out
   }
 
   const sessionsDir = ctx.dshHomePath('storages', 'quota-meter', 'sessions')
@@ -336,6 +378,13 @@ export function apply(ctx) {
         const inner = next()
         for await (const chunk of inner) {
           if (chunk && chunk.type === 'usage' && chunk.usage) {
+            const isPlan = !!(model && prices.plans && prices.plans.indexOf(model) >= 0)
+            if (isPlan) {
+              // 套餐模型：不计费、不计调用、不记未配价；仅发 "Plan" 徽标信号
+              if (isPrimary) { planTick += 1; lastPlanModel = model }
+              yield chunk
+              continue
+            }
             // 模型不在价目表 → 记入未配价集合（走 fallback 计价），供客户端提示
             if (model && !prices.models[model] && ledger.unpricedModels.indexOf(model) < 0) {
               ledger.unpricedModels.push(model)
@@ -395,7 +444,9 @@ export function apply(ctx) {
         const sessionId = url.searchParams.get('sessionId') || ''
 
         if (req.method === 'GET' && url.pathname === '/quota/prices') {
-          sendJson(res, 200, { ok: true, prices })
+          // 附带目录中未配价模型（完整目录扫描，无需用户先调用即可提示）
+          const catalogUnpriced = await catalogUnpricedOf(sessionId)
+          sendJson(res, 200, { ok: true, prices, catalogUnpriced })
           return
         }
 
@@ -408,14 +459,23 @@ export function apply(ctx) {
             sendJson(res, 200, { ok: true, prices })
             return
           }
-          // 忽略 / 取消忽略某个未配价模型（逐个操作，持久化到价目表）
-          if (body && (body.ignore !== undefined || body.unignore !== undefined)) {
-            const name = String(body.ignore !== undefined ? body.ignore : body.unignore).trim()
+          // 忽略/Plan 标记操作（逐个，持久化到价目表）：
+          // ignore/unignore = 按默认价粗算且不再提示；plan/unplan = 套餐模型不计费
+          if (body && (body.ignore !== undefined || body.unignore !== undefined || body.plan !== undefined || body.unplan !== undefined)) {
+            const addOp = body.ignore !== undefined || body.plan !== undefined
+            const name = String(addOp ? (body.ignore !== undefined ? body.ignore : body.plan) : (body.unignore !== undefined ? body.unignore : body.unplan)).trim()
             if (!name) { sendJson(res, 400, { ok: false, reason: 'model name required' }); return }
-            const set = new Set(prices.ignored || [])
-            if (body.ignore !== undefined) set.add(name)
+            const isPlan = body.plan !== undefined || body.unplan !== undefined
+            const list = (isPlan ? (prices.plans || []) : (prices.ignored || []))
+            const set = new Set(list)
+            if (addOp) set.add(name)
             else set.delete(name)
-            prices = Object.assign({}, prices, { ignored: [...set] })
+            // 同一模型不应同时出现在 ignored 与 plans：标记时从另一组移除
+            const other = isPlan ? (prices.ignored || []) : (prices.plans || [])
+            const otherSet = new Set(other)
+            otherSet.delete(name)
+            prices = Object.assign({}, prices,
+              isPlan ? { plans: [...set], ignored: [...otherSet] } : { ignored: [...set], plans: [...otherSet] })
             try {
               mkdirSync(dirname(pricesPath), { recursive: true })
               writeFileSync(pricesPath, JSON.stringify(prices, null, 2))
@@ -446,12 +506,17 @@ export function apply(ctx) {
           const ledger = ledgerOf(sessionId)
           const inflight = inflightCount > 0
           const unpricedModels = (ledger && ledger.unpricedModels) || []
-          // 当前会话选中的模型 + 是否未配价（决定额度条徽标显隐，切换模型即时生效）
+          // 当前会话选中的模型 + 是否未配价（决定额度条徽标显隐，切换模型即时生效；
+          // Plan 套餐模型不计费也不提示）
           const currentModel = await currentModelOf(sessionId)
-          const currentUnpriced = !!currentModel && !prices.models[currentModel]
+          const currentUnpriced = !!currentModel && !prices.models[currentModel] && !((prices.plans || []).indexOf(currentModel) >= 0)
+          const base = {
+            unit: UNIT, inflight, unpricedModels, currentModel, currentUnpriced,
+            planTick, lastPlanModel,
+          }
           const out = ledger === undefined
-            ? { quota: null, spent: 0, calls: 0, exhausted: false, unit: UNIT, inflight, unpricedModels, currentModel, currentUnpriced }
-            : { quota: ledger.quota, spent: round4(ledger.spent), calls: ledger.calls, exhausted: ledger.exhausted, unit: UNIT, inflight, unpricedModels, currentModel, currentUnpriced }
+            ? Object.assign({ quota: null, spent: 0, calls: 0, exhausted: false }, base)
+            : Object.assign({ quota: ledger.quota, spent: round4(ledger.spent), calls: ledger.calls, exhausted: ledger.exhausted }, base)
           sendJson(res, 200, out)
           return
         }
