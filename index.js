@@ -42,7 +42,7 @@ const DEFAULT_PRICES = {
 }
 
 export const name = 'quota-meter'
-export const inject = ['webServer', 'dshHomePath']
+export const inject = ['webServer', 'dshHomePath', 'apiProxy']
 
 function sendJson(res, status, obj) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
@@ -173,6 +173,28 @@ export function apply(ctx) {
   const parentMap = new Map()
   // 进行中的模型调用数（llm/stream 开始 +1 / 结束 -1），供客户端显示"请求中"动效
   let inflightCount = 0
+  // 最近一次主调用使用的模型（apiProxy 查询当前会话模型的兜底）
+  let lastModel = null
+  // 当前会话选中模型查询缓存（按 sessionId + TTL 1.5s，避免 1s 轮询每次都打 RPC）
+  const modelQueryCache = { at: 0, sessionId: null, value: null }
+
+  // 查询会话当前选中的模型（composer 里选的，实时反映模型切换）；
+  // 查询失败（子代理/冷会话/服务不可用）时回退最近一次主调用模型
+  async function currentModelOf(sessionId) {
+    const now = Date.now()
+    if (modelQueryCache.sessionId === sessionId && now - modelQueryCache.at < 1500) return modelQueryCache.value
+    let value = null
+    try {
+      const r = await ctx.apiProxy.sessions.models({ rpcId: 'quota-model-' + now, payload: { sessionId } })
+      const res = r && r.result
+      value = (res && res.ok && res.value && res.value.current && res.value.current.model) || null
+    } catch { /* 查询失败，走兜底 */ }
+    if (!value) value = lastModel
+    modelQueryCache.sessionId = sessionId
+    modelQueryCache.at = now
+    modelQueryCache.value = value
+    return value
+  }
 
   const sessionsDir = ctx.dshHomePath('storages', 'quota-meter', 'sessions')
   const safeId = (id) => String(id).replace(/[^a-zA-Z0-9._-]/g, '_')
@@ -305,7 +327,10 @@ export function apply(ctx) {
     // 只有主对话调用点亮"请求中"动效；compaction/session-title 等辅助调用
     // 不参与 inflight 计数，否则后台摘要会让光带在主对话结束后仍继续扫
     const isPrimary = options.purpose === undefined
-    if (isPrimary) inflightCount += 1
+    if (isPrimary) {
+      inflightCount += 1
+      if (model) lastModel = model
+    }
     return (async function* () {
       try {
         const inner = next()
@@ -421,9 +446,12 @@ export function apply(ctx) {
           const ledger = ledgerOf(sessionId)
           const inflight = inflightCount > 0
           const unpricedModels = (ledger && ledger.unpricedModels) || []
+          // 当前会话选中的模型 + 是否未配价（决定额度条徽标显隐，切换模型即时生效）
+          const currentModel = await currentModelOf(sessionId)
+          const currentUnpriced = !!currentModel && !prices.models[currentModel]
           const out = ledger === undefined
-            ? { quota: null, spent: 0, calls: 0, exhausted: false, unit: UNIT, inflight, unpricedModels }
-            : { quota: ledger.quota, spent: round4(ledger.spent), calls: ledger.calls, exhausted: ledger.exhausted, unit: UNIT, inflight, unpricedModels }
+            ? { quota: null, spent: 0, calls: 0, exhausted: false, unit: UNIT, inflight, unpricedModels, currentModel, currentUnpriced }
+            : { quota: ledger.quota, spent: round4(ledger.spent), calls: ledger.calls, exhausted: ledger.exhausted, unit: UNIT, inflight, unpricedModels, currentModel, currentUnpriced }
           sendJson(res, 200, out)
           return
         }
