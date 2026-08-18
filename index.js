@@ -446,7 +446,17 @@ export function apply(ctx) {
         if (req.method === 'GET' && url.pathname === '/quota/prices') {
           // 附带目录中未配价模型（完整目录扫描，无需用户先调用即可提示）
           const catalogUnpriced = await catalogUnpricedOf(sessionId)
-          sendJson(res, 200, { ok: true, prices, catalogUnpriced })
+          // 峰谷模型当前时段状态（供价格弹层卡片标注"高峰中/空闲中"）
+          const todStatus = {}
+          for (const [name, m] of Object.entries(prices.models || {})) {
+            if (m.pricing === 'per-token-tod') {
+              todStatus[name] = {
+                peak: isPeakTime(m.tod.tz, m.tod.peak),
+                tod: { tz: m.tod.tz, peak: m.tod.peak },
+              }
+            }
+          }
+          sendJson(res, 200, { ok: true, prices, catalogUnpriced, todStatus })
           return
         }
 
@@ -510,8 +520,13 @@ export function apply(ctx) {
           // Plan 套餐模型不计费也不提示）
           const currentModel = await currentModelOf(sessionId)
           const currentUnpriced = !!currentModel && !prices.models[currentModel] && !((prices.plans || []).indexOf(currentModel) >= 0)
+          // 当前模型峰谷状态：per-token-tod 模型按自己声明的 tod 判断当前是否高峰；其他为 null
+          const entry = currentModel ? prices.models[currentModel] : undefined
+          const peak = entry && entry.pricing === 'per-token-tod'
+            ? isPeakTime(entry.tod.tz, entry.tod.peak)
+            : null
           const base = {
-            unit: UNIT, inflight, unpricedModels, currentModel, currentUnpriced,
+            unit: UNIT, inflight, unpricedModels, currentModel, currentUnpriced, peak,
             planTick, lastPlanModel,
           }
           const out = ledger === undefined
