@@ -24,7 +24,7 @@ if ! command -v "$DSH_CMD" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> 安装 quota-meter bundle → profile: $PROFILE"
+echo "==> 安装 quota-meter-shushu bundle → profile: $PROFILE"
 (cd "$REPO" && "$DSH_CMD" plugin --profile "$PROFILE" add .)
 
 echo

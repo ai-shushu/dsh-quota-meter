@@ -1,4 +1,4 @@
-# quota-meter bundle patch — applied when this bundle is listed in a profile's
+# quota-meter-shushu bundle patch — applied when this bundle is listed in a profile's
 # dsh.profile.bundles, i.e. installed via `dsh plugin --profile <name> add <repo>`.
 #
 # Single dual-face row resolved from this bundle's package:
@@ -8,5 +8,5 @@
 #     progress bar above the input (conversation.input.dock)
 #     + exhaustion overlay (shell.overlay)
 - insert:
-    - id: quota-meter
-      name: 'quota-meter'
+    - id: quota-meter-shushu
+      name: 'quota-meter-shushu'

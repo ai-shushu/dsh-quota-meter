@@ -21,7 +21,7 @@
 - **Budget blocking** — 额度耗尽自动拦截新的模型调用（`agent/pre-step`），并弹出提示
 - **Configurable pricing** — 价目表 UI 可编辑、按模型持久化；支持峰谷（time-of-day）定价，每个模型可自定义时区与高峰时段
 - **Per-session scope** — 记账按会话独立；**子代理消耗自动并入父会话额度**（沿代理链上溯到根父），额度条显示真实总花费；辅助调用（标题生成/上下文压缩）同样计费
-- **Persistent ledger** — 额度与已花金额跟随会话持久化（`~/.dsh/storages/quota-meter/sessions/`），重启 dsh 不丢；会话关闭时自动清理，与对话记录生命周期一致
+- **Persistent ledger** — 额度与已花金额跟随会话持久化（`~/.dsh/storages/quota-meter-shushu/sessions/`），重启 dsh 不丢；会话关闭时自动清理，与对话记录生命周期一致
 
 ## 📦 Install / 安装
 
@@ -34,19 +34,19 @@ dsh plugin --profile web add github:ai-shushu/dsh-quota-meter
 Locked version — 锁版本安装（推荐正式环境）：
 
 ```bash
-dsh plugin --profile web add github:ai-shushu/dsh-quota-meter#v0.3.0
+dsh plugin --profile web add github:ai-shushu/dsh-quota-meter#v0.4.0
 ```
 
 - **Client**（进度条/弹层 UI）→ 刷新浏览器即生效
 - **Host**（记账/拦截/接口）→ 重启 dsh web 进程生效
-- **Uninstall / 卸载**：`dsh plugin --profile web remove quota-meter`
+- **Uninstall / 卸载**：`dsh plugin --profile web remove quota-meter-shushu`
 
 > Local development — 本地开发用 checkout 链接（改动即时反映）：
 > `dsh plugin --profile web add /path/to/quota-meter-plugin`
 
 ## 💰 Pricing / 计价
 
-价目表动态可编辑（UI 入口：额度条行尾「价格」），持久化到 `~/.dsh/storages/quota-meter/prices.json`。
+价目表动态可编辑（UI 入口：额度条行尾「价格」），持久化到 `~/.dsh/storages/quota-meter-shushu/prices.json`。
 按 **2026-08-17 起 DeepSeek 官方价**（涨幅后），单位 ¥/每 1M tokens：
 
 ### deepseek-v4-flash

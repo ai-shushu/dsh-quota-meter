@@ -4,7 +4,7 @@
 //   - per-token     恒定价（多数厂商）：prices = { inputMiss, inputHit, output }
 //   - per-token-tod 按 token + 分时段（DeepSeek 峰谷）：prices = { default, peak? }
 // 旧 v1 结构（无 pricing）加载时自动归一化为 per-token。
-// 持久化：~/.dsh/storages/quota-meter/prices.json
+// 持久化：~/.dsh/storages/quota-meter-shushu/prices.json
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -42,7 +42,7 @@ const DEFAULT_PRICES = {
   },
 }
 
-export const name = 'quota-meter'
+export const name = 'quota-meter-shushu'
 export const inject = ['webServer', 'dshHomePath', 'apiProxy']
 
 function sendJson(res, status, obj) {
@@ -168,7 +168,7 @@ function entryPrices(entry) {
 
 export function apply(ctx) {
   // 每会话记账本：{ quota, spent, calls, exhausted }——跟随会话持久化：
-  // 惰性从磁盘恢复（~/.dsh/storages/quota-meter/sessions/<id>.json），
+  // 惰性从磁盘恢复（~/.dsh/storages/quota-meter-shushu/sessions/<id>.json），
   // 变更即写，会话销毁时删除（与对话记录生命周期一致）
   const ledgers = new Map()
   // 子代理会话 → 根父会话 映射：subagent/start 建立，持久化到子会话文件；
@@ -238,7 +238,7 @@ export function apply(ctx) {
     return out
   }
 
-  const sessionsDir = ctx.dshHomePath('storages', 'quota-meter', 'sessions')
+  const sessionsDir = ctx.dshHomePath('storages', 'quota-meter-shushu', 'sessions')
   const safeId = (id) => String(id).replace(/[^a-zA-Z0-9._-]/g, '_')
   const sessionPath = (id) => join(sessionsDir, safeId(id) + '.json')
 
@@ -308,7 +308,7 @@ export function apply(ctx) {
   })
 
   // 价目表：内置默认 + 用户文件覆盖
-  const pricesPath = ctx.dshHomePath('storages', 'quota-meter', 'prices.json')
+  const pricesPath = ctx.dshHomePath('storages', 'quota-meter-shushu', 'prices.json')
   let prices = DEFAULT_PRICES
   try {
     if (existsSync(pricesPath)) {
