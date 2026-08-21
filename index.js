@@ -5,9 +5,12 @@
 //   - per-token-tod 按 token + 分时段（DeepSeek 峰谷）：prices = { default, peak? }
 // 旧 v1 结构（无 pricing）加载时自动归一化为 per-token。
 // 持久化：~/.dsh/storages/quota-meter-shushu/prices.json
+// 官方价格同步：GET /quota/prices/check（抓官方页做 diff，只读）+
+//               POST /quota/prices/apply（确认后合并官方价入库）；见 lib/pricing-fetch.js
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { fetchOfficialPrices, diffPrices, applyOfficial } from './lib/pricing-fetch.js'
 
 const UNIT = '¥'
 
@@ -184,6 +187,8 @@ export function apply(ctx) {
   let lastPlanModel = null
   // 当前会话选中模型查询缓存（按 sessionId + TTL 1.5s，避免 1s 轮询每次都打 RPC）
   const modelQueryCache = { at: 0, sessionId: null, value: null }
+  // 官方价格同步缓存：check 结果 TTL 60s（手动按钮连点/多窗口不反复打官方页）
+  const syncCache = { at: 0, result: null }
 
   // 查询会话当前选中的模型（composer 里选的，实时反映模型切换）；
   // 查询失败（子代理/冷会话/服务不可用）时回退最近一次主调用模型
@@ -520,6 +525,53 @@ export function apply(ctx) {
             return
           }
           console.log('[quota] prices updated: ' + Object.keys(prices.models).join(', '))
+          sendJson(res, 200, { ok: true, prices })
+          return
+        }
+
+        // 官方价格同步（只读检查 + 确认应用；抓取/解析见 lib/pricing-fetch.js）
+        // GET /quota/prices/check → { ok, source, fetchedAt, hasChanges, changes, newModels }
+        if (req.method === 'GET' && url.pathname === '/quota/prices/check') {
+          const now = Date.now()
+          let fetched = syncCache.result
+          if (!fetched || now - syncCache.at >= 60000) {
+            fetched = await fetchOfficialPrices()
+            syncCache.result = fetched
+            syncCache.at = now
+          }
+          if (!fetched.ok) { sendJson(res, 200, { ok: false, reason: fetched.reason }); return }
+          const diff = diffPrices(prices, fetched.models, fetched.tod)
+          sendJson(res, 200, {
+            ok: true,
+            source: fetched.source,
+            fetchedAt: fetched.fetchedAt,
+            hasChanges: diff.hasChanges,
+            changes: diff.changes,
+            newModels: diff.newModels,
+          })
+          return
+        }
+        // POST /quota/prices/apply { models?: string[] } → 合并官方价并持久化
+        if (req.method === 'POST' && url.pathname === '/quota/prices/apply') {
+          const body = await readJsonBody(req)
+          if (!syncCache.result || !syncCache.result.ok) {
+            sendJson(res, 400, { ok: false, reason: 'no fresh check result, run check first' })
+            return
+          }
+          const fetched = syncCache.result
+          const only = Array.isArray(body && body.models) ? body.models.map(String) : null
+          const merged = applyOfficial(prices, fetched.models, fetched.tod, only)
+          const norm = normalizePrices(merged)
+          if (!norm.ok) { sendJson(res, 400, { ok: false, reason: norm.reason }); return }
+          prices = norm.prices
+          try {
+            mkdirSync(dirname(pricesPath), { recursive: true })
+            writeFileSync(pricesPath, JSON.stringify(prices, null, 2))
+          } catch (err) {
+            sendJson(res, 500, { ok: false, reason: 'persist failed: ' + err.message })
+            return
+          }
+          console.log('[quota] prices applied from official (' + fetched.source + '): ' + Object.keys(prices.models).join(', '))
           sendJson(res, 200, { ok: true, prices })
           return
         }
