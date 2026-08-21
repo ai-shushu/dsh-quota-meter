@@ -156,11 +156,12 @@ function normalizePrices(input) {
   return { ok: true, prices: { version: 2, unit: UNIT, per: '1M', fallback, models, ignored, plans } }
 }
 
-// 按定价模式取当前生效价格组（峰谷规则随模型自己的 tod 声明）
-function entryPrices(entry) {
+// 按定价模式取当前生效价格组（峰谷规则随模型自己的 tod 声明）；
+// date 可选：传调用发起时刻则按发起时刻判峰谷（避免跨时段调用按结束时刻计价）
+function entryPrices(entry, date) {
   if (entry.pricing === 'per-token-tod') {
     const tod = entry.tod || { tz: 'Asia/Shanghai', peak: [[9, 12], [14, 18]] }
-    const peak = isPeakTime(tod.tz, tod.peak)
+    const peak = isPeakTime(tod.tz, tod.peak, date)
     return peak && entry.prices.peak ? entry.prices.peak : entry.prices.default
   }
   return entry.prices
@@ -347,10 +348,19 @@ export function apply(ctx) {
   }
 
   // TokenUsage 字段互斥（dsh 官方语义）：inputTokens=未缓存输入；
-  // cacheRead+cacheWrite=缓存输入；outputTokens=输出
-  function costOf(model, usage) {
-    const entry = prices.models[model] || prices.models[prices.fallback]
-    const t = entryPrices(entry)
+  // cacheRead+cacheWrite=缓存输入；outputTokens=输出（已含 reasoning）。
+  // 计价链：精确模型 → 同 provider 已知模型（估算，跨 provider 不误用 fallback 价）→ fallback。
+  // atDate 可选：传调用发起时刻，峰谷档位按发起时刻判定。
+  function costOf(model, usage, provider, atDate) {
+    let entry = prices.models[model]
+    if (!entry && provider) {
+      // 未配价模型：按同 provider 已配价模型的价格估算（近似，仍提示用户补配）
+      for (const name of Object.keys(prices.models)) {
+        if (prices.models[name].provider === provider) { entry = prices.models[name]; break }
+      }
+    }
+    if (!entry) entry = prices.models[prices.fallback]
+    const t = entryPrices(entry, atDate)
     const miss = usage.inputTokens || 0
     const hit = (usage.cacheReadTokens || 0) + (usage.cacheWriteTokens || 0)
     const out = usage.outputTokens || 0
@@ -366,6 +376,9 @@ export function apply(ctx) {
     const target = rootSessionId(options.sessionId)
     const ledger = ledgerOf(target)
     const model = String(options.model || '')
+    const provider = String(options.provider || '')
+    // 调用发起时刻：跨时段的调用按发起时刻判峰谷档（而非 usage 到达时刻）
+    const startTime = new Date()
     // 只有主对话调用点亮"请求中"动效；compaction/session-title 等辅助调用
     // 不参与 inflight 计数，否则后台摘要会让光带在主对话结束后仍继续扫
     const isPrimary = options.purpose === undefined
@@ -390,13 +403,13 @@ export function apply(ctx) {
               ledger.unpricedModels.push(model)
               persistLedger(target, ledger)
             }
-            const cost = costOf(model, chunk.usage)
+            const cost = costOf(model, chunk.usage, provider, startTime)
             if (cost > 0) {
               ledger.spent += cost
               ledger.calls += 1
               if (ledger.quota !== null && ledger.spent >= ledger.quota) ledger.exhausted = true
               persistLedger(target, ledger)
-              console.log('[quota] session=' + target + ' (child ' + options.sessionId + (target === options.sessionId ? '' : ' -> merged') + ') model=' + model + ' +' + cost.toFixed(6) + ' spent=' + ledger.spent.toFixed(6) + ' calls=' + ledger.calls + ' exhausted=' + ledger.exhausted)
+              console.log('[quota] session=' + target + ' (child ' + options.sessionId + (target === options.sessionId ? '' : ' -> merged') + ') model=' + model + ' provider=' + provider + ' +' + cost.toFixed(6) + ' spent=' + ledger.spent.toFixed(6) + ' calls=' + ledger.calls + ' exhausted=' + ledger.exhausted)
             }
           }
           yield chunk
