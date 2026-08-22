@@ -1,7 +1,7 @@
 {
   "name": "quota-meter-shushu",
-  "version": "0.5.0",
-  "description": "会话额度监控（官方 dsh bundle）：按 DeepSeek 官方价格记账、额度耗尽拦截 + 输入框上方进度条 UI",
+  "version": "0.6.0",
+  "description": "会话额度监控（官方 dsh bundle）：按 (provider, model) 价目表记账、额度耗尽拦截 + 输入框上方进度条 UI",
   "type": "module",
   "main": "index.js",
   "exports": {

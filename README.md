@@ -1,6 +1,6 @@
 # Quota Meter · 会话额度监控
 
-> **Per-session spend & quota meter for [DSH](https://github.com/deepseek-harness) — real token billing, live progress bar, budget blocking, configurable multi-model pricing.**
+> **Per-session spend & quota meter for [DSH](https://github.com/deepseek-harness) — real token billing, live progress bar, budget blocking, configurable multi-provider model pricing.**
 >
 > 给 DSH 的每个会话窗口设置金额额度：按真实 token 用量 × 可配置价目表记账，输入框上方显示消耗进度条，额度耗尽时自动拦截新的模型调用。
 
@@ -20,6 +20,7 @@
 - **Live progress bar** — 输入框上方 2px 细条实时显示剩余额度（右对齐倒退），请求发起时左侧"燃烧"亮点脉动，扣费瞬间弹出 `-¥` 金额徽标
 - **Budget blocking** — 额度耗尽自动拦截新的模型调用（`agent/pre-step`），并弹出提示
 - **Configurable pricing** — 价目表 UI 可编辑、按模型持久化；支持峰谷（time-of-day）定价，每个模型可自定义时区与高峰时段
+- **Per-provider model pricing (v0.6+)** — 价目表以 **(provider, model)** 二元组为键：多个厂家提供同名同 ID 模型（如两个厂家的 `deepseek-v4-pro`）可独立配价、独立记账，互不覆盖；「添加模型」的平台字段从目录下拉选择（受控枚举），杜绝手滑拼错厂家产生重复
 - **Per-session scope** — 记账按会话独立；**子代理消耗自动并入父会话额度**（沿代理链上溯到根父），额度条显示真实总花费；辅助调用（标题生成/上下文压缩）同样计费
 - **Persistent ledger** — 额度与已花金额跟随会话持久化（`~/.dsh/storages/quota-meter-shushu/sessions/`），重启 dsh 不丢；会话关闭时自动清理，与对话记录生命周期一致
 
